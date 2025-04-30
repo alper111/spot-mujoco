@@ -355,6 +355,88 @@ def add_visual_capsule(scene, point1, point2, radius, rgba):
                              point2[0], point2[1], point2[2])
 
 
+def build_sinusoidal_traj(params, env, n_step, n_repeat):
+    """
+    params: [gait_period, amplitude, leg_hy, leg_kn]
+    returns control sequence shape (1, n_step*n_repeat, n_joints)
+    """
+    gait_period, amplitude, leg_hy, leg_kn = params
+    n_joints = env.action_space.shape[0]
+    dt = env.model.opt.timestep
+    # initialize ctrl buffer
+    ctrl = np.zeros((1, n_step * n_repeat, n_joints), dtype=np.float64)
+
+    for t in range(n_step):
+        phase = 2 * np.pi * ((t * dt) % gait_period) / gait_period
+        sinp = np.sin(phase)
+
+        # one step of controls
+        step_ctrl = np.zeros((n_joints,), dtype=np.float64)
+        # hip-pitch trot: FL/HR in phase, FR/HL out of phase
+        step_ctrl[1] = amplitude * sinp   # fl_hy
+        step_ctrl[4] = -amplitude * sinp   # fr_hy
+        step_ctrl[7] = -amplitude * sinp   # hl_hy
+        step_ctrl[10] = amplitude * sinp   # hr_hy
+
+        # fix knee angles for support
+        for _, idx_kn in [(1, 2), (4, 5), (7, 8), (10, 11)]:
+            step_ctrl[idx_kn] = leg_kn
+
+        # optionally set roll joints to some offset (e.g. leg_hy)
+        for idx_hy, _ in [(1, 2), (4, 5), (7, 8), (10, 11)]:
+            step_ctrl[idx_hy] = leg_hy
+
+        # repeat this step n_repeat times
+        for r in range(n_repeat):
+            ctrl[0, t * n_repeat + r, :] = step_ctrl
+
+    return ctrl
+
+
+def body_res(params, env, x=None, y=None, z=None, n_step=100, initial_state=None):
+    ctrl_b = np.array(params).reshape(4, 1, -1)
+    ctrl_b = ctrl_b.repeat(n_step, axis=1)
+    ctrl_b = np.transpose(ctrl_b, (2, 1, 0))
+    n_batch = ctrl_b.shape[0]
+    ctrl = np.zeros((n_batch, n_step, env.model.nu), dtype=np.float64)
+    ctrl[:, :] = env.data.ctrl.copy()
+    ctrl[:, :, 1] = ctrl_b[:, :, 0]
+    ctrl[:, :, 2] = ctrl_b[:, :, 1]
+    ctrl[:, :, 4] = ctrl_b[:, :, 0]
+    ctrl[:, :, 5] = ctrl_b[:, :, 1]
+    ctrl[:, :, 7] = ctrl_b[:, :, 2]
+    ctrl[:, :, 8] = ctrl_b[:, :, 3]
+    ctrl[:, :, 10] = ctrl_b[:, :, 2]
+    ctrl[:, :, 11] = ctrl_b[:, :, 3]
+
+    # prepare state
+    scratch = [copy(env.data) for _ in range(n_batch)]
+    if initial_state is None:
+        initial_state = env.get_mjstate(nbatch=n_batch)
+
+    # perform rollout
+    state, _ = mujoco.rollout.rollout(model=env.model,
+                                      data=scratch,
+                                      initial_state=initial_state,
+                                      control=ctrl)
+
+    # compute error against target
+    errors = []
+    for i, s in enumerate(state):
+        mujoco.mj_setState(env.model, scratch[i], s[-1],
+                           mujoco.mjtState.mjSTATE_FULLPHYSICS)
+        pos = scratch[i].body("body").xpos
+        err = 0
+        if x is not None:
+            err += (pos[0] - x) ** 2
+        if y is not None:
+            err += (pos[1] - y) ** 2
+        if z is not None:
+            err += (pos[2] - z) ** 2
+        errors.append(err)
+    return np.array(errors).reshape(1, -1)
+
+
 if __name__ == "__main__":
     N_EXP = 100
     N_BATCH = 100
