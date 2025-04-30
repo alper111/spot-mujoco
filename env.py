@@ -1,24 +1,20 @@
 import time
+from copy import copy
 
 import numpy as np
 from dm_control import mjcf
 import mujoco
 import mujoco.viewer
-import gymnasium as gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.logger import configure
-from stable_baselines3.common.utils import set_random_seed
+import mujoco.rollout
 
 
-class BaseEnv(gym.Env):
+class BaseEnv:
     def __init__(self, render_mode="gui", real_time=False, max_timesteps=10000) -> None:
         self._render_mode = render_mode
         self._real_time = real_time
         self._max_timesteps = max_timesteps
-
         self.viewer = None
+
         self._joint_names = [
             "fl_hx",
             "fl_hy",
@@ -41,18 +37,10 @@ class BaseEnv(gym.Env):
             "arm_f1x",
         ]
         self._n_joints = len(self._joint_names)
-        self.action_space = gym.spaces.Box(
-            low=-3.14,
-            high=3.14,
-            shape=(self._n_joints,),
-            dtype=np.float64,
-        )
-        self.observation_space = gym.spaces.Box(
-            low=-100,
-            high=100,
-            shape=(self._n_joints*2+7,),
-            dtype=np.float64,
-        )
+        self._ee_site = "gripper_site"
+        self._max_leg_angle = 0.1235335
+        self._leg_length = 0.6888
+
         self.reset()
 
     @property
@@ -107,9 +95,25 @@ class BaseEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_string(xml_string, assets=assets)
         self.data = mujoco.MjData(self.model)
         if self._render_mode == "gui":
-            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data,
+                                                       show_left_ui=False, show_right_ui=False)
+            self.viewer.lock()
+            self.viewer.cam.fixedcamid = 0
+            self.viewer.cam.type = 2
         elif self._render_mode == "offscreen":
             self.viewer = mujoco.Renderer(self.model, 128, 128)
+
+        self.data.ctrl[1] = np.pi/4
+        self.data.ctrl[2] = -np.pi/2
+        self.data.ctrl[4] = np.pi/4
+        self.data.ctrl[5] = -np.pi/2
+        self.data.ctrl[7] = np.pi/4
+        self.data.ctrl[8] = -np.pi/2
+        self.data.ctrl[10] = np.pi/4
+        self.data.ctrl[11] = -np.pi/2
+
+        self.data.ctrl[13] = -np.pi
+        self.data.ctrl[14] = np.pi
 
         self._t = 0
         return self.observation, self.info
@@ -126,8 +130,17 @@ class BaseEnv(gym.Env):
 
     def _create_scene(self):
         scene = mjcf.from_path("mujoco_menagerie/boston_dynamics_spot/scene_arm.xml")
-        create_visual(scene, "sphere", pos=[2, 0, 0.65222], quat=[1, 0, 0, 0],
-                      size=[0.05], rgba=[0.2, 1.0, 0.2, 1], name="goal")
+        add_camera_to_scene(scene, "camera", position=[0.5, 3, 0.75], target=[1.75, 0, 1])
+        gripper = scene.find("body", "arm_link_fngr")
+        gripper.add("site", name="gripper_site", pos=[0.05, 0, -0.03], size=[0.02, 0.02, 0.02], rgba=[1, 0, 0, 0])
+        size = np.zeros((3,))
+        size[0] = np.random.uniform(0.05, 0.35)
+        size[1] = np.random.uniform(0.05, 0.35)
+        size[2] = np.random.uniform(0.005, 0.15)
+        self._platform_size = size*2
+        create_object(scene, "box", pos=[2, 0, size[2]], quat=[1, 0, 0, 0],
+                      size=size, rgba=[0.8, 0.3, 0.3, 1], name="platform", static=False)
+        scene.find("key", "home").remove()
         return scene
 
     def _step(self):
@@ -169,6 +182,94 @@ class BaseEnv(gym.Env):
 
             if it > max_iters:
                 break
+
+    def _set_hip_angle(self, angle, n_step=1):
+        angle = max(angle, self._max_leg_angle)
+        q = np.zeros(self._n_joints)
+        q = self.data.ctrl[:]
+        curr_angle = q[7]
+        intpl = np.linspace(curr_angle, angle, n_step+1)[1:]
+        for q_i in intpl:
+            q[7] = q_i
+            q[8] = -2*q_i
+            q[10] = q_i
+            q[11] = -2*q_i
+            for _ in range(100):
+                self._step()
+
+    def _set_chest_angle(self, angle, n_step=1):
+        angle = max(angle, self._max_leg_angle)
+        q = np.zeros(self._n_joints)
+        q = self.data.ctrl[:]
+        curr_angle = q[1]
+        intpl = np.linspace(curr_angle, angle, n_step+1)[1:]
+        for q_i in intpl:
+            q[1] = q_i
+            q[2] = -2*q_i
+            q[4] = q_i
+            q[5] = -2*q_i
+            for _ in range(100):
+                self._step()
+
+    def _set_hip_height(self, height):
+        max_height = self._leg_length * np.cos(self._max_leg_angle)
+        height = min(height, max_height)
+        angle = np.arccos(height/self._leg_length)
+        self._set_hip_angle(angle)
+
+    def _set_chest_height(self, height):
+        max_height = self._leg_length * np.cos(self._max_leg_angle)
+        height = min(height, max_height)
+        angle = np.arccos(height/self._leg_length)
+        self._set_chest_angle(angle)
+
+    def _set_front_leg_angle(self, angle):
+        self.data.ctrl[0] = -angle
+        self.data.ctrl[3] = angle
+
+    def get_gripper_position(self):
+        return self.data.site(self._ee_site).xpos
+
+    def reach(self, n_step=100):
+
+        q = np.zeros(self._n_joints)
+        q = self.data.ctrl[:]
+        q_13_c = q[13]
+        q_14_c = q[14]
+
+        q13_intpl = np.linspace(q_13_c, -1.6, n_step+1)[1:]
+        q14_intpl = np.linspace(q_14_c, 0.4, n_step+1)[1:]
+        for i in range(n_step):
+            q[1] = q[1] + 0.2/n_step
+            q[4] = q[4] + 0.2/n_step
+            q[7] = q[7] + 0.2/n_step
+            q[10] = q[10] + 0.2/n_step
+            q[13] = q13_intpl[i]
+            q[14] = q14_intpl[i]
+            self._set_joint_position(q)
+
+    def teleport(self, x=None, y=None, z=None, qw=None, qx=None, qy=None, qz=None):
+        if x is not None:
+            self.data.qpos[0] = x
+        if y is not None:
+            self.data.qpos[1] = y
+        if z is not None:
+            self.data.qpos[2] = z
+        if qw is not None:
+            self.data.qpos[3] = qw
+        if qx is not None:
+            self.data.qpos[4] = qx
+        if qy is not None:
+            self.data.qpos[5] = qy
+        if qz is not None:
+            self.data.qpos[6] = qz
+        self._step()
+
+    def get_mjstate(self, nbatch=1):
+        full_physics = mujoco.mjtState.mjSTATE_FULLPHYSICS
+        state = np.zeros((mujoco.mj_stateSize(self.model, full_physics),))
+        mujoco.mj_getState(self.model, self.data, state, full_physics)
+        return np.tile(state, (nbatch, 1))
 
 
 def create_object(root, obj_type, pos, quat, size, rgba, friction=[0.5, 0.005, 0.0001], density=1000,
@@ -255,22 +356,25 @@ def add_visual_capsule(scene, point1, point2, radius, rgba):
 
 
 if __name__ == "__main__":
-    env = BaseEnv("offscreen")
-    check_env(env)
-    model = PPO("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=10000000)
-    model.save("spot_arm")
+    N_EXP = 100
+    N_BATCH = 100
+    N_STEP = 500
 
-# set_random_seed(4)
-# env = MNISTHyperGrid(dimensions=(6, 6), eps=0.05, max_episode_steps=20)
-# eval_env = MNISTHyperGrid(dimensions=(6, 6), eps=0.05, max_episode_steps=20)
-# check_env(env)
+    env = BaseEnv(render_mode="gui", real_time=False)
+    results = np.zeros((N_EXP, 4))
 
-# logger = configure("out/logs/", ["csv", "stdout"])
-# model = DQN("MlpPolicy", env, verbose=1)
-# model.set_logger(logger)
-# eval_callback = EvalCallback(eval_env, eval_freq=100, n_eval_episodes=10)
-# model.learn(total_timesteps=40_000, callback=eval_callback)
+    for i in range(N_EXP):
+        env.reset()
+        results[i, :3] = env._platform_size
+        print(results[i])
 
-# env.close()
-# eval_env.close()
+        env.teleport(x=1.75-env._platform_size[0]/2, y=0, z=0.72+env._platform_size[2])
+        env._set_front_leg_angle(0.25)
+        env._set_hip_height(0.683)
+        env._set_chest_height(0.683-env._platform_size[2]-0.01)
+        for _ in range(1000):
+            env._step()
+        env.reach()
+        for _ in range(1000):
+            env._step()
+        print(env.get_gripper_position())
