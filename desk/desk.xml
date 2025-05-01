@@ -1,0 +1,30 @@
+<mujoco model="desk">
+  <default>
+    <default class="visual">
+      <geom group="2" type="mesh" contype="0" conaffinity="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3" type="mesh"/>
+    </default>
+  </default>
+  <asset>
+    <texture type="2d" name="Metal009_2K_Color" file="Metal009_2K_Color.png"/>
+    <material name="Bolt" texture="Metal009_2K_Color" specular="0.5" shininess="0.5"/>
+    <material name="Metal" specular="0.5" shininess="0.003360637" rgba="0.000000 0.000000 0.000000 1.000000"/>
+    <texture type="2d" name="Wood009_2K_Color" file="Wood009_2K_Color.png"/>
+    <material name="Wood" texture="Wood009_2K_Color" specular="0.5" shininess="0.0"/>
+    <mesh file="desk_0.obj"/>
+    <mesh file="desk_1.obj"/>
+    <mesh file="desk_2.obj"/>
+  </asset>
+  <worldbody>
+    <body name="desk">
+      <geom mesh="desk_0" material="Bolt" class="visual"/>
+      <geom mesh="desk_1" material="Metal" class="visual"/>
+      <geom mesh="desk_2" material="Wood" class="visual"/>
+      <geom mesh="desk_0" class="collision"/>
+      <geom mesh="desk_1" class="collision"/>
+      <geom mesh="desk_2" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

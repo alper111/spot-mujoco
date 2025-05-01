@@ -2,6 +2,7 @@ import time
 from copy import copy
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 from dm_control import mjcf
 import mujoco
 import mujoco.viewer
@@ -75,10 +76,7 @@ class BaseEnv:
     def info(self):
         return {}
 
-    def reset(self, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
-
+    def reset(self, path=None):
         if hasattr(self, "model"):
             del self.model
         if hasattr(self, "data"):
@@ -89,7 +87,7 @@ class BaseEnv:
             else:
                 self.viewer.close()
 
-        scene = self._create_scene()
+        scene = self._create_scene(path)
         xml_string = scene.to_xml_string()
         assets = scene.get_assets()
         self.model = mujoco.MjModel.from_xml_string(xml_string, assets=assets)
@@ -113,7 +111,9 @@ class BaseEnv:
         self.data.ctrl[11] = -np.pi/2
 
         self.data.ctrl[13] = -np.pi
-        self.data.ctrl[14] = np.pi
+        self.data.ctrl[14] = 7*np.pi/8
+        for _ in range(2000):
+            self._step()
 
         self._t = 0
         return self.observation, self.info
@@ -128,19 +128,37 @@ class BaseEnv:
         info = self.info
         return observation, reward, terminated, truncated, info
 
-    def _create_scene(self):
+    def _create_scene(self, path=None):
         scene = mjcf.from_path("mujoco_menagerie/boston_dynamics_spot/scene_arm.xml")
-        add_camera_to_scene(scene, "camera", position=[0.5, 3, 0.75], target=[1.75, 0, 1])
+        add_camera_to_scene(scene, "camera", position=[0, 1, 2], target=[1.75, 0, 1])
         gripper = scene.find("body", "arm_link_fngr")
         gripper.add("site", name="gripper_site", pos=[0.05, 0, -0.03], size=[0.02, 0.02, 0.02], rgba=[1, 0, 0, 0])
-        size = np.zeros((3,))
-        size[0] = np.random.uniform(0.05, 0.35)
-        size[1] = np.random.uniform(0.05, 0.35)
-        size[2] = np.random.uniform(0.005, 0.15)
-        self._platform_size = size*2
-        create_object(scene, "box", pos=[2, 0, size[2]], quat=[1, 0, 0, 0],
-                      size=size, rgba=[0.8, 0.3, 0.3, 1], name="platform", static=False)
+
+        create_object(scene, "box", pos=[2.025, -0.3, 1.7], quat=[1, 0, 0, 0], density=10000,
+                      size=[0.02, 0.02, 0.02], rgba=[0.8, 0.3, 0.3, 1], name="goal", static=False)
+
+        bookshelf = mjcf.from_path("bookshelf/bookshelf_scaled.xml")
+        q = R.from_euler("xyz", np.array([np.pi/2, 0, -np.pi/2])).as_quat(scalar_first=True)
+        scene.worldbody.add("site", type="sphere", pos=[2.2055, 0, 0], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="bookshelf_site")
+        scene.find("site", "bookshelf_site").attach(bookshelf)
         scene.find("key", "home").remove()
+
+        cardboard = mjcf.from_path("cardboard/cardboard.xml")
+        scene.worldbody.add("site", type="sphere", pos=[2-0.381/2, 0.05, 0.381/2], size=[0.01, 0.01, 0.01], rgba=[1, 0, 0, 0], name="cardboard_site")
+        scene.find("site", "cardboard_site").attach(cardboard)
+
+        desk = mjcf.from_path("desk/desk.xml")
+        q = R.from_euler("xyz", np.array([np.pi/2, 0, 0])).as_quat(scalar_first=True)
+        scene.worldbody.add("site", type="sphere", pos=[2.2055, -0.8095, 0.], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="desk_site")
+        scene.find("site", "desk_site").attach(desk)
+
+        if path is not None:
+            cube = mjcf.from_path(path)
+            q = R.from_euler("xyz", np.array([np.pi/2, 0, -np.pi/2])).as_quat(scalar_first=True)
+            site = scene.worldbody.add("site", type="sphere", pos=[1.65, -0.3, 1], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="cube_site")
+            body = site.attach(cube)
+            body.add("joint", type="free", name="cube_freejoint")
+
         return scene
 
     def _step(self):
@@ -226,6 +244,8 @@ class BaseEnv:
     def _set_front_leg_angle(self, angle):
         self.data.ctrl[0] = -angle
         self.data.ctrl[3] = angle
+        for _ in range(5):
+            self._step()
 
     def get_gripper_position(self):
         return self.data.site(self._ee_site).xpos
@@ -237,15 +257,36 @@ class BaseEnv:
         q_13_c = q[13]
         q_14_c = q[14]
 
-        q13_intpl = np.linspace(q_13_c, -1.6, n_step+1)[1:]
+        q13_intpl = np.linspace(q_13_c, -1.73, n_step+1)[1:]
         q14_intpl = np.linspace(q_14_c, 0.4, n_step+1)[1:]
         for i in range(n_step):
-            q[1] = q[1] + 0.2/n_step
-            q[4] = q[4] + 0.2/n_step
-            q[7] = q[7] + 0.2/n_step
-            q[10] = q[10] + 0.2/n_step
-            q[13] = q13_intpl[i]
+            q[1] = q[1] + 0.1/n_step
+            q[4] = q[4] + 0.1/n_step
+            q[7] = q[7] + 0.1/n_step
+            q[10] = q[10] + 0.1/n_step
             q[14] = q14_intpl[i]
+            self._set_joint_position(q)
+        for i in range(n_step):
+            q[1] = q[1] + 0.1/n_step
+            q[4] = q[4] + 0.1/n_step
+            q[7] = q[7] + 0.1/n_step
+            q[10] = q[10] + 0.1/n_step
+            q[13] = q13_intpl[i]
+            self._set_joint_position(q)
+
+        q[15] = 0
+        q[16] = 0.77
+        q[17] = -np.pi/2
+        q[18] = -np.pi/2
+        for _ in range(n_step):
+            self._set_joint_position(q)
+
+        q14_intpl = np.linspace(0.4, 0.64, n_step+1)[1:]
+        for i in range(n_step):
+            q[14] = q14_intpl[i]
+            self._set_joint_position(q)
+        q[18] = 0
+        for _ in range(n_step):
             self._set_joint_position(q)
 
     def teleport(self, x=None, y=None, z=None, qw=None, qx=None, qy=None, qz=None):
@@ -442,21 +483,20 @@ if __name__ == "__main__":
     N_BATCH = 100
     N_STEP = 500
 
-    env = BaseEnv(render_mode="gui", real_time=False)
+    env = BaseEnv(render_mode="gui")
     results = np.zeros((N_EXP, 4))
 
-    for i in range(N_EXP):
-        env.reset()
-        results[i, :3] = env._platform_size
-        print(results[i])
+    for i in range(20):
+        for j in [0, 1]:
+            env.reset(f"cube_dataset/height/iter-{i}/objs_def/0_{i}/0_{i}.xml")
 
-        env.teleport(x=1.75-env._platform_size[0]/2, y=0, z=0.72+env._platform_size[2])
-        env._set_front_leg_angle(0.25)
-        env._set_hip_height(0.683)
-        env._set_chest_height(0.683-env._platform_size[2]-0.01)
-        for _ in range(1000):
-            env._step()
-        env.reach()
-        for _ in range(1000):
-            env._step()
-        print(env.get_gripper_position())
+            env.teleport(x=1.3, y=-0.3, z=1)
+            # env._set_front_leg_angle(0.25)
+            env._set_hip_height(0.683)
+            env._set_chest_height(0.64-(i//5)*0.02)
+            for _ in range(1000):
+                env._step()
+            env.reach()
+            for _ in range(1000):
+                env._step()
+            print(i, j, env.get_gripper_position()[2])
