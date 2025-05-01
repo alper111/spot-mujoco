@@ -1,5 +1,6 @@
 import time
 from copy import copy
+from PIL import Image
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -99,7 +100,7 @@ class BaseEnv:
             self.viewer.cam.fixedcamid = 0
             self.viewer.cam.type = 2
         elif self._render_mode == "offscreen":
-            self.viewer = mujoco.Renderer(self.model, 128, 128)
+            self.viewer = mujoco.Renderer(self.model, 256, 256)
 
         self.data.ctrl[1] = np.pi/4
         self.data.ctrl[2] = -np.pi/2
@@ -158,6 +159,8 @@ class BaseEnv:
             site = scene.worldbody.add("site", type="sphere", pos=[1.65, -0.3, 1], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="cube_site")
             body = site.attach(cube)
             body.add("joint", type="free", name="cube_freejoint")
+            create_object(scene, "box", pos=[1.65, -0.3, 1.7], quat=[1, 0, 0, 0],
+                          size=[0.001, 0.001, 0.001], rgba=[0.8, 0.3, 0.3, 1], name="dummy", static=False)
 
         return scene
 
@@ -229,6 +232,27 @@ class BaseEnv:
             for _ in range(100):
                 self._step()
 
+    def _set_chest_and_hip_angle(self, qc, qh, n_step=1):
+        qc = max(qc, self._max_leg_angle)
+        qh = max(qh, self._max_leg_angle)
+        q = np.zeros(self._n_joints)
+        q = self.data.ctrl[:]
+        curr_qc = q[1]
+        curr_qh = q[7]
+        c_int = np.linspace(curr_qc, qc, n_step+1)[1:]
+        h_int = np.linspace(curr_qh, qh, n_step+1)[1:]
+        for i in range(len(c_int)):
+            q[1] = c_int[i]
+            q[2] = -2*c_int[i]
+            q[4] = c_int[i]
+            q[5] = -2*c_int[i]
+            q[7] = h_int[i]
+            q[8] = -2*h_int[i]
+            q[10] = h_int[i]
+            q[11] = -2*h_int[i]
+            for _ in range(100):
+                self._step()
+
     def _set_hip_height(self, height):
         max_height = self._leg_length * np.cos(self._max_leg_angle)
         height = min(height, max_height)
@@ -240,6 +264,15 @@ class BaseEnv:
         height = min(height, max_height)
         angle = np.arccos(height/self._leg_length)
         self._set_chest_angle(angle)
+
+    def _set_chest_and_hip_height(self, ch, hh):
+        max_height = self._leg_length * np.cos(self._max_leg_angle)
+        ch = min(ch, max_height)
+        hh = min(hh, max_height)
+        qc = np.arccos(ch/self._leg_length)
+        qh = np.arccos(hh/self._leg_length)
+        self._set_chest_and_hip_angle(qc, qh)
+
 
     def _set_front_leg_angle(self, angle):
         self.data.ctrl[0] = -angle
@@ -486,17 +519,24 @@ if __name__ == "__main__":
     env = BaseEnv(render_mode="gui")
     results = np.zeros((N_EXP, 4))
 
-    for i in range(20):
-        for j in [0, 1]:
-            env.reset(f"cube_dataset/height/iter-{i}/objs_def/0_{i}/0_{i}.xml")
+    for dim in ["height", "length", "width"]:
+        for i in range(20):
+            for j in [0, 1]:
+                env.reset(f"cube_dataset/{dim}/iter-{i}/objs_def/0_{i}/0_{i}.xml")
+                height = env.data.body("dummy").xpos[2]
 
-            env.teleport(x=1.3, y=-0.3, z=1)
-            # env._set_front_leg_angle(0.25)
-            env._set_hip_height(0.683)
-            env._set_chest_height(0.64-(i//5)*0.02)
-            for _ in range(1000):
-                env._step()
-            env.reach()
-            for _ in range(1000):
-                env._step()
-            print(i, j, env.get_gripper_position()[2])
+                env.teleport(x=1.3, y=-0.3, z=0.72+height)
+                # env._set_front_leg_angle(0.25)
+                env._set_chest_and_hip_height(0.683 - height, 0.683)
+                for _ in range(1000):
+                    env._step()
+                env.reach()
+                for _ in range(1000):
+                    env._step()
+                print(dim, i, j, env.get_gripper_position(), "obj height", height)
+
+                # only for offscreen rendering
+                # env.viewer.update_scene(env.data, camera="camera")
+                # pixels = env.viewer.render()
+                # img = Image.fromarray(pixels)
+                # img.save(f"out/{dim}_{i}_{j}.png")
