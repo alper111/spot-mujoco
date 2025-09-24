@@ -273,54 +273,109 @@ class BaseEnv:
         qh = np.arccos(hh/self._leg_length)
         self._set_chest_and_hip_angle(qc, qh)
 
-
     def _set_front_leg_angle(self, angle):
         self.data.ctrl[0] = -angle
         self.data.ctrl[3] = angle
         for _ in range(5):
             self._step()
 
-    def get_gripper_position(self):
-        return self.data.site(self._ee_site).xpos
+    def _open_gripper(self):
+        self.data.ctrl[18] = -1.57
+        for _ in range(5):
+            self._step()
 
-    def reach(self, n_step=100):
+    def _close_gripper(self):
+        self.data.ctrl[18] = 0.0
+        for _ in range(5):
+            self._step()
 
-        q = np.zeros(self._n_joints)
-        q = self.data.ctrl[:]
-        q_13_c = q[13]
-        q_14_c = q[14]
+    def get_ee_pose(self):
+        position = self.data.site(self._ee_site).xpos.copy()
+        rotation = self.data.site(self._ee_site).xmat.copy()
+        orientation = np.zeros(4)
+        mujoco.mju_mat2Quat(orientation, rotation)
+        return position, orientation
 
-        q13_intpl = np.linspace(q_13_c, -1.73, n_step+1)[1:]
-        q14_intpl = np.linspace(q_14_c, 0.4, n_step+1)[1:]
-        for i in range(n_step):
-            q[1] = q[1] + 0.1/n_step
-            q[4] = q[4] + 0.1/n_step
-            q[7] = q[7] + 0.1/n_step
-            q[10] = q[10] + 0.1/n_step
-            q[14] = q14_intpl[i]
-            self._set_joint_position(q)
-        for i in range(n_step):
-            q[1] = q[1] + 0.1/n_step
-            q[4] = q[4] + 0.1/n_step
-            q[7] = q[7] + 0.1/n_step
-            q[10] = q[10] + 0.1/n_step
-            q[13] = q13_intpl[i]
-            self._set_joint_position(q)
+    def _set_ee_pose(self, position, rotation=None, orientation=None, max_iters=100, threshold=0.02):
+        if rotation is not None and orientation is not None:
+            raise Exception("Either rotation or orientation can be set.")
 
-        q[15] = 0
-        q[16] = 0.77
-        q[17] = -np.pi/2
-        q[18] = -np.pi/2
-        for _ in range(n_step):
-            self._set_joint_position(q)
+        quat = None
+        if rotation is not None:
+            quat = R.from_euler("xyz", rotation, degrees=True).as_quat()
+        elif orientation is not None:
+            quat = orientation
 
-        q14_intpl = np.linspace(0.4, 0.64, n_step+1)[1:]
-        for i in range(n_step):
-            q[14] = q14_intpl[i]
-            self._set_joint_position(q)
-        q[18] = 0
-        for _ in range(n_step):
-            self._set_joint_position(q)
+        dof_indices = [self.model.joint(name).qposadr for name in self._joint_names]
+        result = qpos_from_site_pose(self.model, self.data, self._ee_site, position, quat,
+                                     self._joint_names)
+        qpos = result.qpos
+        qdict = {i: qpos[q_idx] for i, q_idx in enumerate(dof_indices)}
+
+        max_error = 100*threshold
+        it = 0
+        while max_error > threshold:
+
+            it += 1
+            self._step()
+            max_error = 0
+            curr_pos, curr_quat = self.get_ee_pose()
+            max_error += np.linalg.norm(np.array(position) - curr_pos)
+
+            # this part is taken from dm_control
+            # https://github.com/deepmind/dm_control/blob/main/dm_control/utils/inverse_kinematics.py#L165
+            if quat is not None:
+                neg_quat = np.zeros(4)
+                mujoco.mju_negQuat(neg_quat, curr_quat)
+                error_quat = np.zeros(4)
+                mujoco.mju_mulQuat(error_quat, quat, neg_quat)
+                error_vel = np.zeros(3)
+                mujoco.mju_quat2Vel(error_vel, error_quat, 1)
+                max_error += np.linalg.norm(error_vel)
+            for idx in qdict:
+                self.data.ctrl[idx] = qdict[idx]
+            if it > max_iters:
+                break
+
+    def _set_ee_pose_fullbody(self, target_pos=None, target_quat=None, n_via=10, T=3.0):
+        if target_pos is None and target_quat is None:
+            raise Exception("Both position and orientation are None.")
+        assert n_via >= 1, "n_via should be greater or equal than 1"
+
+        pos, quat = self.get_ee_pose()
+        delta_time = T / n_via
+        pos_traj = None
+        quat_traj = None
+
+        if target_pos is not None:
+            pos_traj = np.linspace(pos, target_pos, n_via+1)[1:]
+
+        if target_quat is not None:
+            cq = R.from_quat(quat, scalar_first=True)
+            tq = R.from_quat(target_quat, scalar_first=True)
+            slerp = Slerp([0, T], R.concatenate([cq, tq]))
+            quat_traj = slerp(np.linspace(0, T, n_via+1)[1:]).as_quat(scalar_first=True)
+
+        lower = self.model.actuator_ctrlrange[:, 0].reshape(-1, 1)
+        upper = self.model.actuator_ctrlrange[:, 1].reshape(-1, 1)
+
+        for j in range(n_via):
+            x0 = self.data.ctrl.copy().reshape(-1, 1)
+
+            def reach_target(x):
+                return ik_residual(x, self.model, self.data, "gripper_site",
+                                   target_pos=pos_traj[j] if pos_traj is not None else None,
+                                   target_quat=quat_traj[j] if quat_traj is not None else None,
+                                   T=delta_time, rot_weight=1.0)
+
+            x, _ = mujoco.minimize.least_squares(x0, reach_target, [lower, upper], xtol=1e-3, gtol=1e-3, verbose=False)
+            x0 = self.data.ctrl.copy()
+            xT = x[:, 0]
+            delta_nstep = int(np.round(delta_time / self.model.opt.timestep))
+            ctrl = np.linspace(x0, xT, delta_nstep+1)[1:]
+            for ctrl_i in ctrl:
+                self.data.ctrl[:] = ctrl_i
+                self._step()
 
     def teleport(self, x=None, y=None, z=None, qw=None, qx=None, qy=None, qz=None):
         if x is not None:
@@ -511,32 +566,187 @@ def body_res(params, env, x=None, y=None, z=None, n_step=100, initial_state=None
     return np.array(errors).reshape(1, -1)
 
 
-if __name__ == "__main__":
-    N_EXP = 100
-    N_BATCH = 100
-    N_STEP = 500
+def ik_residual(u,
+                model,
+                data,
+                site_name,
+                target_pos=None,
+                target_quat=None,
+                T=1.0,
+                rot_weight=1.0):
+    scratch = deepcopy(data)
+    dtype = scratch.qpos.dtype
+    if target_pos is not None and target_quat is not None:
+        err = np.empty(6, dtype=dtype)
+        err_pos, err_rot = err[:3], err[3:]
+    else:
+        err = np.empty(3, dtype=dtype)
+        if target_pos is not None:
+            err_pos, err_rot = err, None
+        elif target_quat is not None:
+            err_pos, err_rot = None, err
+        else:
+            raise ValueError("At least one of `target_pos` or `target_quat` must be specified.")
 
-    env = BaseEnv(render_mode="gui")
-    results = np.zeros((N_EXP, 4))
+    if target_quat is not None:
+        site_xquat = np.empty(4, dtype=dtype)
+        neg_site_xquat = np.empty(4, dtype=dtype)
+        err_rot_quat = np.empty(4, dtype=dtype)
 
-    for dim in ["height", "length", "width"]:
-        for i in range(20):
-            for j in [0, 1]:
-                env.reset(f"cube_dataset/{dim}/iter-{i}/objs_def/0_{i}/0_{i}.xml")
-                height = env.data.body("dummy").xpos[2]
+    # get the state
+    full_physics = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    mjstate = np.zeros((mujoco.mj_stateSize(model, full_physics),))
+    mujoco.mj_getState(model, scratch, mjstate, full_physics)
 
-                env.teleport(x=1.3, y=-0.3, z=0.72+height)
-                # env._set_front_leg_angle(0.25)
-                env._set_chest_and_hip_height(0.683 - height, 0.683)
-                for _ in range(1000):
-                    env._step()
-                env.reach()
-                for _ in range(1000):
-                    env._step()
-                print(dim, i, j, env.get_gripper_position(), "obj height", height)
+    # interpolate the control input
+    ctrlT = u.T
+    ctrl0 = scratch.ctrl.copy().reshape(1, -1)
+    ctrl0 = np.tile(ctrl0, (ctrlT.shape[0], 1))
 
-                # only for offscreen rendering
-                # env.viewer.update_scene(env.data, camera="camera")
-                # pixels = env.viewer.render()
-                # img = Image.fromarray(pixels)
-                # img.save(f"out/{dim}_{i}_{j}.png")
+    # Interpolate and stack the control sequences
+    nstep = int(np.round(T / model.opt.timestep))
+    ctrl = np.stack(np.linspace(ctrl0, ctrlT, nstep), axis=1)
+
+    # perform rollout
+    state, _ = mujoco.rollout.rollout(model=model,
+                                      data=scratch,
+                                      initial_state=mjstate,
+                                      control=ctrl)
+
+    errors = []
+    for i, s in enumerate(state):
+        # compute the error
+        mujoco.mj_setState(model, scratch, s[-1], full_physics)
+        mujoco.mj_forward(model, scratch)
+        err_norm = 0.0
+        if target_pos is not None:
+            # translational error.
+            err_pos[:] = target_pos - scratch.site(site_name).xpos
+            err_norm += np.linalg.norm(err_pos)
+        if target_quat is not None:
+            # rotational error.
+            mujoco.mju_mat2Quat(site_xquat, scratch.site(site_name).xmat)
+            mujoco.mju_negQuat(neg_site_xquat, site_xquat)
+            mujoco.mju_mulQuat(err_rot_quat, target_quat, neg_site_xquat)
+            mujoco.mju_quat2Vel(err_rot, err_rot_quat, 1)
+            err_norm += np.linalg.norm(err_rot) * rot_weight
+        errors.append(err_norm)
+    errors = np.array(errors).reshape(1, -1)
+    return errors
+
+
+# modified from https://github.com/deepmind/dm_control/blob/main/dm_control/utils/inverse_kinematics.py
+def qpos_from_site_pose(model,
+                        data,
+                        site_name,
+                        target_pos=None,
+                        target_quat=None,
+                        joint_names=None,
+                        tol=1e-14,
+                        rot_weight=1.0,
+                        regularization_threshold=0.1,
+                        regularization_strength=3e-2,
+                        max_update_norm=2.0,
+                        progress_thresh=20.0,
+                        max_steps=100,
+                        inplace=False):
+    dtype = data.qpos.dtype
+
+    if target_pos is not None and target_quat is not None:
+        jac = np.empty((6, model.nv), dtype=dtype)
+        err = np.empty(6, dtype=dtype)
+        jac_pos, jac_rot = jac[:3], jac[3:]
+        err_pos, err_rot = err[:3], err[3:]
+    else:
+        jac = np.empty((3, model.nv), dtype=dtype)
+        err = np.empty(3, dtype=dtype)
+        if target_pos is not None:
+            jac_pos, jac_rot = jac, None
+            err_pos, err_rot = err, None
+        elif target_quat is not None:
+            jac_pos, jac_rot = None, jac
+            err_pos, err_rot = None, err
+        else:
+            raise ValueError("At least one of `target_pos` or `target_quat` must be specified.")
+
+    update_nv = np.zeros(model.nv, dtype=dtype)
+
+    if target_quat is not None:
+        site_xquat = np.empty(4, dtype=dtype)
+        neg_site_xquat = np.empty(4, dtype=dtype)
+        err_rot_quat = np.empty(4, dtype=dtype)
+
+    if not inplace:
+        data = deepcopy(data)
+
+    mujoco.mj_fwdPosition(model, data)
+    site_id = model.site(site_name).id
+
+    # todo: check they are indeed updated in place
+
+    if joint_names is None:
+        dof_indices = slice(None)
+    elif isinstance(joint_names, (list, np.ndarray, tuple)):
+        if isinstance(joint_names, tuple):
+            joint_names = list(joint_names)
+        dof_indices = [model.joint(name).dofadr[0] for name in joint_names]
+    else:
+        raise ValueError(f"`joint_names` must be either None, a list, a tuple, or a numpy array; "
+                         f"got {type(joint_names)}.")
+
+    success = False
+    qpos = data.qpos.copy()
+    for steps in range(max_steps):
+        err_norm = 0.0
+
+        if target_pos is not None:
+            # translational error.
+            err_pos[:] = target_pos - data.site(site_name).xpos
+            err_norm += np.linalg.norm(err_pos)
+        if target_quat is not None:
+            # rotational error.
+            mujoco.mju_mat2Quat(site_xquat, data.site(site_name).xmat)
+            mujoco.mju_negQuat(neg_site_xquat, site_xquat)
+            mujoco.mju_mulQuat(err_rot_quat, target_quat, neg_site_xquat)
+            mujoco.mju_quat2Vel(err_rot, err_rot_quat, 1)
+            err_norm += np.linalg.norm(err_rot) * rot_weight
+
+        if err_norm < tol:
+            success = True
+            break
+        else:
+            mujoco.mj_jacSite(model, data, jac_pos, jac_rot, site_id)
+            jac_joints = jac[:, dof_indices]
+            reg_strength = regularization_strength if err_norm > regularization_threshold else 0.0
+            update_joints = nullspace_method(jac_joints, err, regularization_strength=reg_strength)
+            update_norm = np.linalg.norm(update_joints)
+
+        progress_criterion = err_norm / update_norm
+        if progress_criterion > progress_thresh:
+            break
+
+        if update_norm > max_update_norm:
+            update_joints *= max_update_norm / update_norm
+
+        update_nv[dof_indices] = update_joints
+        mujoco.mj_integratePos(model, data.qpos, update_nv, 1)
+        mujoco.mj_fwdPosition(model, data)
+
+        if not inplace:
+            qpos = data.qpos.copy()
+        else:
+            qpos = data.qpos
+
+    return IKResult(qpos, err_norm, steps, success)
+
+
+# modified from https://github.com/deepmind/dm_control/blob/main/dm_control/utils/inverse_kinematics.py
+def nullspace_method(jac_joints, delta, regularization_strength=0.0):
+    hess_approx = jac_joints.T.dot(jac_joints)
+    joint_delta = jac_joints.T.dot(delta)
+    if regularization_strength > 0:
+        # L2 regularization
+        hess_approx += np.eye(hess_approx.shape[0]) * regularization_strength
+        return np.linalg.solve(hess_approx, joint_delta)
+    else:
+        return np.linalg.lstsq(hess_approx, joint_delta, rcond=-1)[0]
