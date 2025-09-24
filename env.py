@@ -1,13 +1,18 @@
+import collections
 import time
-from copy import copy
-from PIL import Image
+from copy import copy, deepcopy
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 from dm_control import mjcf
 import mujoco
 import mujoco.viewer
+import mujoco.minimize
 import mujoco.rollout
+
+IKResult = collections.namedtuple(
+    'IKResult', ['qpos', 'err_norm', 'steps', 'success'])
 
 
 class BaseEnv:
@@ -131,9 +136,9 @@ class BaseEnv:
 
     def _create_scene(self, path=None):
         scene = mjcf.from_path("mujoco_menagerie/boston_dynamics_spot/scene_arm.xml")
-        add_camera_to_scene(scene, "camera", position=[0, 1, 2], target=[1.75, 0, 1])
-        gripper = scene.find("body", "arm_link_fngr")
-        gripper.add("site", name="gripper_site", pos=[0.05, 0, -0.03], size=[0.02, 0.02, 0.02], rgba=[1, 0, 0, 0])
+        add_camera_to_scene(scene, "camera", position=[-1, -2, 2], target=[1.75, -0.25, 1])
+        gripper = scene.find("body", "arm_link_wr1")
+        gripper.add("site", name="gripper_site", pos=[0.2, 0., -0.025], size=[0.02, 0.02, 0.02], rgba=[0, 1, 1, 0.4])
 
         create_object(scene, "box", pos=[2.025, -0.3, 1.7], quat=[1, 0, 0, 0], density=10000,
                       size=[0.02, 0.02, 0.02], rgba=[0.8, 0.3, 0.3, 1], name="goal", static=False)
