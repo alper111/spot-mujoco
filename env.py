@@ -111,13 +111,15 @@ class BaseEnv:
         self.data.ctrl[2] = -np.pi/2
         self.data.ctrl[4] = np.pi/4
         self.data.ctrl[5] = -np.pi/2
-        self.data.ctrl[7] = np.pi/4
-        self.data.ctrl[8] = -np.pi/2
-        self.data.ctrl[10] = np.pi/4
-        self.data.ctrl[11] = -np.pi/2
+        self.data.ctrl[7] = 1.03
+        self.data.ctrl[8] = -1.
+        self.data.ctrl[10] = 1.03
+        self.data.ctrl[11] = -1.
 
         self.data.ctrl[13] = -np.pi
         self.data.ctrl[14] = 7*np.pi/8
+
+        self.data.ctrl[16] = -1.57
         for _ in range(2000):
             self._step()
 
@@ -136,12 +138,12 @@ class BaseEnv:
 
     def _create_scene(self, path=None):
         scene = mjcf.from_path("mujoco_menagerie/boston_dynamics_spot/scene_arm.xml")
-        add_camera_to_scene(scene, "camera", position=[-1, -2, 2], target=[1.75, -0.25, 1])
+        add_camera_to_scene(scene, "camera", position=[0.5, -2, 2.25], target=[1.75, -0.25, 1])
         gripper = scene.find("body", "arm_link_wr1")
         gripper.add("site", name="gripper_site", pos=[0.2, 0., -0.025], size=[0.02, 0.02, 0.02], rgba=[0, 1, 1, 0.4])
 
-        create_object(scene, "box", pos=[2.025, -0.3, 1.7], quat=[1, 0, 0, 0], density=10000,
-                      size=[0.02, 0.02, 0.02], rgba=[0.8, 0.3, 0.3, 1], name="goal", static=False)
+        scene.worldbody.add("site", name="goal", pos=[2.025, -0.3, 1.66528183], type="box",
+                            quat=[1, 0, 0, 0], size=[0.02, 0.02, 0.02], rgba=[0.8, 0.3, 0.3, 1.0])
 
         bookshelf = mjcf.from_path("bookshelf/bookshelf_scaled.xml")
         q = R.from_euler("xyz", np.array([np.pi/2, 0, -np.pi/2])).as_quat(scalar_first=True)
@@ -159,12 +161,13 @@ class BaseEnv:
         scene.find("site", "desk_site").attach(desk)
 
         if path is not None:
-            cube = mjcf.from_path(path)
+            cube = mjcf.from_xml_string(path)
+            cube.worldbody.body[0].geom[1].friction = [10.0, 10.0, 10.0]
             q = R.from_euler("xyz", np.array([np.pi/2, 0, -np.pi/2])).as_quat(scalar_first=True)
-            site = scene.worldbody.add("site", type="sphere", pos=[1.65, -0.3, 1], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="cube_site")
+            site = scene.worldbody.add("site", type="sphere", pos=[1.75, -0.3, 1], size=[0.01, 0.01, 0.01], quat=q, rgba=[1, 0, 0, 0], name="cube_site")
             body = site.attach(cube)
             body.add("joint", type="free", name="cube_freejoint")
-            create_object(scene, "box", pos=[1.65, -0.3, 1.7], quat=[1, 0, 0, 0],
+            create_object(scene, "box", pos=[1.75, -0.3, 1.65], quat=[1, 0, 0, 0],
                           size=[0.001, 0.001, 0.001], rgba=[0.8, 0.3, 0.3, 1], name="dummy", static=False)
 
         return scene
@@ -301,6 +304,22 @@ class BaseEnv:
         mujoco.mju_mat2Quat(orientation, rotation)
         return position, orientation
 
+    def move_to_ee_pose(self, position, orientation=None, T=1.0):
+        pos, quat = self.get_ee_pose()
+        n_step = int(np.round(T / self.model.opt.timestep))
+        pos_traj = np.linspace(pos, position, n_step+1)[1:]
+        quat_traj = None
+
+        if orientation is not None:
+            cq = R.from_quat(quat, scalar_first=True)
+            tq = R.from_quat(orientation, scalar_first=True)
+            slerp = Slerp([0, T], R.concatenate([cq, tq]))
+            quat_traj = slerp(np.linspace(0, T, n_step+1)[1:]).as_quat(scalar_first=True)
+
+        for j, p_j in enumerate(pos_traj):
+            q_j = quat_traj[j] if quat_traj is not None else None
+            self._set_ee_pose(p_j, orientation=q_j, max_iters=1, threshold=0.001)
+
     def _set_ee_pose(self, position, rotation=None, orientation=None, max_iters=100, threshold=0.02):
         if rotation is not None and orientation is not None:
             raise Exception("Either rotation or orientation can be set.")
@@ -311,9 +330,9 @@ class BaseEnv:
         elif orientation is not None:
             quat = orientation
 
-        dof_indices = [self.model.joint(name).qposadr for name in self._joint_names]
+        dof_indices = [self.model.joint(name).qposadr for name in self._joint_names[12:]]
         result = qpos_from_site_pose(self.model, self.data, self._ee_site, position, quat,
-                                     self._joint_names)
+                                     self._joint_names[12:])
         qpos = result.qpos
         qdict = {i: qpos[q_idx] for i, q_idx in enumerate(dof_indices)}
 
@@ -338,8 +357,8 @@ class BaseEnv:
                 mujoco.mju_quat2Vel(error_vel, error_quat, 1)
                 max_error += np.linalg.norm(error_vel)
             for idx in qdict:
-                self.data.ctrl[idx] = qdict[idx]
-            if it > max_iters:
+                self.data.ctrl[idx+12] = qdict[idx]
+            if it >= max_iters:
                 break
 
     def _set_ee_pose_fullbody(self, target_pos=None, target_quat=None, n_via=10, T=3.0):
